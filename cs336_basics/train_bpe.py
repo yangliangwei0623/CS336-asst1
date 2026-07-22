@@ -15,15 +15,136 @@ training, following the CS336 assignment 1 specification:
 
 from __future__ import annotations
 
+import multiprocessing
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
+from typing import BinaryIO
 
 import regex as re
 
 # GPT-2 pre-tokenizer pattern (from the GPT-2 / tiktoken implementations).
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
+# Below this file size (bytes) we pre-tokenize serially: spawning worker
+# processes would cost more than it saves on small corpora.
+_PARALLEL_MIN_BYTES = 1_000_000
 
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """Split a file into byte ranges that can be pre-tokenized independently.
+
+    Boundaries are snapped forward to the next occurrence of
+    ``split_special_token`` so that no pre-token (and no special token) is cut in
+    half across chunks. May return fewer than ``desired_num_chunks`` ranges if
+    boundaries collapse onto each other.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+    # Initial guesses for chunk boundary locations, uniformly spaced.
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead 4k bytes at a time.
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)
+        while True:
+            mini_chunk = file.read(mini_chunk_size)
+            if mini_chunk == b"":  # EOF: snap this boundary to end of file.
+                chunk_boundaries[bi] = file_size
+                break
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    return sorted(set(chunk_boundaries))
+
+
+def _count_pretokens(text: str, special_tokens: list[str]) -> Counter[tuple[bytes, ...]]:
+    """Pre-tokenize ``text`` and return pre-token frequencies.
+
+    The text is split on special tokens (never merged across), then each document
+    is pre-tokenized with the GPT-2 regex. Every pre-token is stored as a tuple
+    of single-byte tokens.
+    """
+    if special_tokens:
+        split_pattern = "|".join(re.escape(token) for token in special_tokens)
+        documents = re.split(split_pattern, text)
+    else:
+        documents = [text]
+
+    counts: Counter[tuple[bytes, ...]] = Counter()
+    for document in documents:
+        for match in re.finditer(PAT, document):
+            encoded = match.group().encode("utf-8")
+            word = tuple(bytes([b]) for b in encoded)
+            counts[word] += 1
+    return counts
+
+
+def _pretokenize_chunk(args: tuple[str, int, int, list[str]]) -> Counter[tuple[bytes, ...]]:
+    """Worker entry point: read a byte range from the file and count pre-tokens."""
+    input_path, start, end, special_tokens = args
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        text = f.read(end - start).decode("utf-8", errors="ignore")
+    return _count_pretokens(text, special_tokens)
+
+
+def _parallel_pretokenize(
+    input_path: str | os.PathLike,
+    special_tokens: list[str],
+    num_processes: int | None,
+) -> Counter[tuple[bytes, ...]]:
+    """Pre-tokenize the whole corpus, in parallel for large files.
+
+    The file is chunked at occurrences of the first special token so each worker
+    processes a self-contained byte range; the per-chunk pre-token Counters are
+    then summed into a single frequency table.
+    """
+    if num_processes is None:
+        num_processes = multiprocessing.cpu_count()
+    num_processes = max(1, num_processes)
+
+    file_size = os.path.getsize(input_path)
+    # Chunk boundaries must land on a byte string that actually occurs in the
+    # file. A special token is ideal (it also bounds documents); fall back to a
+    # newline when no special tokens were given.
+    split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
+
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, split_token)
+
+    chunk_args = [
+        (os.fspath(input_path), start, end, special_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+
+    word_freqs: Counter[tuple[bytes, ...]] = Counter()
+    # Small file, single worker, or a single chunk: skip process startup cost.
+    if num_processes == 1 or len(chunk_args) <= 1 or file_size < _PARALLEL_MIN_BYTES:
+        for args in chunk_args:
+            word_freqs.update(_pretokenize_chunk(args))
+    else:
+        with multiprocessing.Pool(num_processes) as pool:
+            for counts in pool.imap_unordered(_pretokenize_chunk, chunk_args):
+                word_freqs.update(counts)
+
+    return word_freqs
+
+
+#返回合并后的word
 def _merge_word(
     word: tuple[bytes, ...],
     pair: tuple[bytes, bytes],
@@ -50,6 +171,7 @@ def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
+    num_processes: int | None = None,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Train a byte-level BPE tokenizer.
 
@@ -58,6 +180,8 @@ def train_bpe(
         vocab_size: Desired final vocabulary size, including the 256 byte values
             and the special tokens.
         special_tokens: Strings that are never split or merged.
+        num_processes: Number of worker processes for pre-tokenization. Defaults
+            to the CPU count; ``1`` forces serial pre-tokenization.
 
     Returns:
         vocab: Mapping from token ID to token bytes.
@@ -68,37 +192,23 @@ def train_bpe(
     for token in special_tokens:
         vocab[len(vocab)] = token.encode("utf-8")
 
-    # 2. Read the corpus and split it on special tokens so that merges never
-    #    cross a special-token boundary.
-    with open(input_path, "rb") as f:
-        text = f.read().decode("utf-8", errors="ignore")
-
-    if special_tokens:
-        split_pattern = "|".join(re.escape(token) for token in special_tokens)
-        documents = re.split(split_pattern, text)
-    else:
-        documents = [text]
-
-    # 3. Pre-tokenize each document and count pre-token frequencies. Each
-    #    pre-token starts life as a tuple of single-byte tokens.
-    word_freqs: dict[tuple[bytes, ...], int] = defaultdict(int)
-    for document in documents:
-        for match in re.finditer(PAT, document):
-            encoded = match.group().encode("utf-8")
-            word = tuple(bytes([b]) for b in encoded)
-            word_freqs[word] += 1
+    # 2 & 3. Pre-tokenize the corpus (parallelized for large files) into a table
+    #        of pre-token -> frequency, where each pre-token is a tuple of
+    #        single-byte tokens. Special tokens bound the chunks and documents,
+    #        so merges never cross a special-token boundary.
+    word_freqs = _parallel_pretokenize(input_path, special_tokens, num_processes)
 
     # 4. Build the initial pair statistics: how often each adjacent pair occurs,
     #    and which words contain each pair (so we only revisit affected words).
     pair_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
-    pair_to_words: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = defaultdict(set)
+    pair_to_words: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = defaultdict(set)# 记录每个字节对（Pair）出现在了哪些单词（Word）中。
     for word, freq in word_freqs.items():
         for pair in zip(word, word[1:]):
             pair_counts[pair] += freq
             pair_to_words[pair].add(word)
 
     merges: list[tuple[bytes, bytes]] = []
-    num_merges = vocab_size - len(vocab)
+    num_merges = vocab_size - len(vocab)#vocab_size代表大模型最终能输出多少种token，每执行一次合并，能输出的token种类就在已有基础上
 
     for _ in range(num_merges):
         if not pair_counts:
