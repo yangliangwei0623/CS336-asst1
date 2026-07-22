@@ -247,3 +247,67 @@ def train_bpe(
                 pair_to_words[pair].add(merged_word)
 
     return vocab, merges
+
+
+def _save_bpe(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    output_dir: str | os.PathLike,
+) -> None:
+    """Serialize the trained vocab and merges to ``output_dir``.
+
+    ``vocab.pkl`` and ``merges.pkl`` hold the raw ``bytes`` objects (ready to feed
+    straight back into a tokenizer). ``merges.txt`` is a human-readable dump.
+    """
+    import pickle
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "vocab.pkl"), "wb") as f:
+        pickle.dump(vocab, f)
+    with open(os.path.join(output_dir, "merges.pkl"), "wb") as f:
+        pickle.dump(merges, f)
+    with open(os.path.join(output_dir, "merges.txt"), "w", encoding="utf-8") as f:
+        for a, b in merges:
+            f.write(f"{a!r} {b!r}\n")
+
+
+def main() -> None:
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description="Train a byte-level BPE tokenizer.")
+    parser.add_argument("--input_path", required=True, help="Path to the training corpus.")
+    parser.add_argument("--vocab_size", type=int, default=10000, help="Final vocabulary size.")
+    parser.add_argument(
+        "--special_tokens",
+        nargs="*",
+        default=["<|endoftext|>"],
+        help="Special tokens that are never split or merged.",
+    )
+    parser.add_argument("--output_dir", default=".", help="Directory to write vocab/merges into.")
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=None,
+        help="Worker processes for pre-tokenization (default: CPU count).",
+    )
+    args = parser.parse_args()
+
+    start = time.time()
+    vocab, merges = train_bpe(
+        input_path=args.input_path,
+        vocab_size=args.vocab_size,
+        special_tokens=args.special_tokens,
+        num_processes=args.num_processes,
+    )
+    elapsed = time.time() - start
+
+    _save_bpe(vocab, merges, args.output_dir)
+    longest = max(vocab.values(), key=len)
+    print(f"Trained BPE in {elapsed:.1f}s: {len(vocab)} vocab, {len(merges)} merges.")
+    print(f"Longest token ({len(longest)} bytes): {longest!r}")
+    print(f"Saved vocab.pkl / merges.pkl / merges.txt to {os.path.abspath(args.output_dir)}")
+
+
+if __name__ == "__main__":
+    main()
